@@ -201,8 +201,15 @@ export default function App() {
 
           {/* Error display */}
           {error && (
-            <div className="card">
+            <div className="card" style={{ borderLeft: "4px solid #dc3545" }}>
               <p className="error-text">{error}</p>
+            </div>
+          )}
+
+          {/* Empty state after loading */}
+          {!loading && !error && events.length === 0 && (from || to) && (
+            <div className="card">
+              <p>No events found for the selected time range. Make sure the date range matches events visible in your Eufy app.</p>
             </div>
           )}
 

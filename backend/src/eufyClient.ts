@@ -247,9 +247,29 @@ export class EufyService {
   ): Promise<EventRecord[]> {
     this.ensureConnected();
 
-    const events = await this.client!.getApi().getVideoEvents(from, to, {
-      deviceSN: deviceSerialNumber,
-    });
+    logger.info(
+      { deviceSN: deviceSerialNumber, from: from.toISOString(), to: to.toISOString() },
+      "Querying Eufy cloud for video events"
+    );
+
+    const api = this.client!.getApi();
+    const filter = { deviceSN: deviceSerialNumber };
+
+    let events = await api.getVideoEvents(from, to, filter);
+    logger.info({ deviceSN: deviceSerialNumber, count: events.length }, "getVideoEvents result");
+
+    if (events.length === 0) {
+      logger.info("Video records empty, trying history records endpoint");
+      events = await api.getHistoryEvents(from, to, filter);
+      logger.info({ deviceSN: deviceSerialNumber, count: events.length }, "getHistoryEvents result");
+    }
+
+    if (events.length === 0) {
+      logger.warn(
+        { deviceSN: deviceSerialNumber },
+        "Both cloud endpoints returned zero events — events may only exist on local station storage"
+      );
+    }
 
     return events.map((e) => ({
       id: `${e.device_sn}_${e.start_time}`,
@@ -257,7 +277,7 @@ export class EufyService {
       deviceName: e.device_name,
       stationSerialNumber: e.station_sn,
       storagePath: e.storage_path,
-      hevcStoragePath: e.hevc_storage_path,
+      hevcStoragePath: e.hevc_storage_path ?? "",
       cipherId: e.cipher_id,
       startTime: e.start_time,
       endTime: e.end_time,
