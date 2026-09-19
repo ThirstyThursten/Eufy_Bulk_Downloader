@@ -17,6 +17,7 @@ import {
   Station,
   DatabaseReturnCode,
   LoginOptions,
+  FilterStorageType,
 } from "eufy-security-client";
 
 dotenv.config();
@@ -185,8 +186,24 @@ async function main() {
       continue;
     }
 
-    // ── Test 2: databaseQueryByDate ─────────────────────────────
-    log("TEST", "2/3  databaseQueryByDate...");
+    // ── Test 2: databaseCountByDate ───────────────────────────
+    log("TEST", "2/6  databaseCountByDate...");
+    try {
+      const p = waitForEvent(client, "station database count by date", sn, QUERY_TIMEOUT);
+      station.databaseCountByDate(dayStart, dayEnd);
+      const result = await p;
+      log("TEST", `  Result: code=${result.returnCode}, records=${Array.isArray(result.data) ? result.data.length : "?"}`);
+      if (Array.isArray(result.data)) {
+        for (const entry of result.data) {
+          log("TEST", "  ", entry);
+        }
+      }
+    } catch (err) {
+      log("TEST", `  FAILED: ${err instanceof Error ? err.message : err}`);
+    }
+
+    // ── Test 3: databaseQueryByDate (default storageType=NONE → storage_cloud=-1) ──
+    log("TEST", "3/6  databaseQueryByDate (default, storage_cloud=-1)...");
     try {
       const p = waitForEvent(client, "station database query by date", sn, QUERY_TIMEOUT);
       station.databaseQueryByDate(stationDevices, dayStart, dayEnd);
@@ -199,8 +216,136 @@ async function main() {
       log("TEST", `  FAILED: ${err instanceof Error ? err.message : err}`);
     }
 
-    // ── Test 3: databaseQueryLocal ──────────────────────────────
-    log("TEST", "3/3  databaseQueryLocal...");
+    // ── Test 4: databaseQueryByDate with FilterStorageType.LOCAL ──
+    log("TEST", "4/6  databaseQueryByDate (storageType=LOCAL, storage_cloud=1)...");
+    try {
+      const p = waitForEvent(client, "station database query by date", sn, QUERY_TIMEOUT);
+      station.databaseQueryByDate(stationDevices, dayStart, dayEnd, 0, 0, FilterStorageType.LOCAL);
+      const result = await p;
+      log("TEST", `  Result: code=${result.returnCode}, records=${Array.isArray(result.data) ? result.data.length : "?"}`);
+      if (Array.isArray(result.data) && result.data.length > 0) {
+        log("TEST", "  First record:", result.data[0]);
+      }
+    } catch (err) {
+      log("TEST", `  FAILED: ${err instanceof Error ? err.message : err}`);
+    }
+
+    // ── Test 5: databaseQueryByDate with FilterStorageType.CLOUD ──
+    log("TEST", "5/6  databaseQueryByDate (storageType=CLOUD, storage_cloud=2)...");
+    try {
+      const p = waitForEvent(client, "station database query by date", sn, QUERY_TIMEOUT);
+      station.databaseQueryByDate(stationDevices, dayStart, dayEnd, 0, 0, FilterStorageType.CLOUD);
+      const result = await p;
+      log("TEST", `  Result: code=${result.returnCode}, records=${Array.isArray(result.data) ? result.data.length : "?"}`);
+      if (Array.isArray(result.data) && result.data.length > 0) {
+        log("TEST", "  First record:", result.data[0]);
+      }
+    } catch (err) {
+      log("TEST", `  FAILED: ${err instanceof Error ? err.message : err}`);
+    }
+
+    // ── Test 6: raw P2P command (count=500, ai_type=-1, storage_cloud=1) ──
+    log("TEST", "6/8  raw P2P databaseQueryByDate (count=500, ai_type=-1, storage_cloud=1)...");
+    try {
+      const p2pSession = (station as any).p2pSession;
+      const rawStation = (station as any).rawStation;
+
+      const pad2 = (n: number) => String(n).padStart(2, "0");
+      const fmtDate = (d: Date) =>
+        `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}`;
+      const startStr = fmtDate(dayStart);
+      const endStr = fmtDate(dayEnd);
+
+      const p = waitForEvent(client, "station database query by date", sn, QUERY_TIMEOUT);
+      p2pSession.sendCommandWithStringPayload({
+        commandType: 1350,
+        value: JSON.stringify({
+          account_id: rawStation.member.admin_user_id,
+          cmd: 1306,
+          mChannel: 0,
+          mValue3: 0,
+          payload: {
+            cmd: 10006,
+            payload: {
+              count: 500,
+              detection_type: 0,
+              device_info: stationDevices.map((s: string) => ({ device_sn: s })),
+              end_date: endStr,
+              event_type: 0,
+              flag: 0,
+              res_unzip: 1,
+              start_date: startStr,
+              start_time: `${startStr}000000`,
+              storage_cloud: 1,
+              ai_type: -1,
+            },
+            table: "history_record_info",
+            transaction: `${Date.now()}`,
+          },
+        }),
+        channel: 0,
+      });
+      const result = await p;
+      log("TEST", `  Result: code=${result.returnCode}, records=${Array.isArray(result.data) ? result.data.length : "?"}`);
+      if (Array.isArray(result.data) && result.data.length > 0) {
+        log("TEST", "  First record:", result.data[0]);
+      }
+    } catch (err) {
+      log("TEST", `  FAILED: ${err instanceof Error ? err.message : err}`);
+    }
+
+    // ── Test 7: raw P2P command without device_info filtering ──
+    log("TEST", "7/8  raw P2P databaseQueryByDate (no device filter, storage_cloud=1)...");
+    try {
+      const p2pSession = (station as any).p2pSession;
+      const rawStation = (station as any).rawStation;
+
+      const pad2 = (n: number) => String(n).padStart(2, "0");
+      const fmtDate = (d: Date) =>
+        `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}`;
+      const startStr = fmtDate(dayStart);
+      const endStr = fmtDate(dayEnd);
+
+      const p = waitForEvent(client, "station database query by date", sn, QUERY_TIMEOUT);
+      p2pSession.sendCommandWithStringPayload({
+        commandType: 1350,
+        value: JSON.stringify({
+          account_id: rawStation.member.admin_user_id,
+          cmd: 1306,
+          mChannel: 0,
+          mValue3: 0,
+          payload: {
+            cmd: 10006,
+            payload: {
+              count: 500,
+              detection_type: 0,
+              device_info: [],
+              end_date: endStr,
+              event_type: 0,
+              flag: 0,
+              res_unzip: 1,
+              start_date: startStr,
+              start_time: `${startStr}000000`,
+              storage_cloud: 1,
+              ai_type: -1,
+            },
+            table: "history_record_info",
+            transaction: `${Date.now()}`,
+          },
+        }),
+        channel: 0,
+      });
+      const result = await p;
+      log("TEST", `  Result: code=${result.returnCode}, records=${Array.isArray(result.data) ? result.data.length : "?"}`);
+      if (Array.isArray(result.data) && result.data.length > 0) {
+        log("TEST", "  First record:", result.data[0]);
+      }
+    } catch (err) {
+      log("TEST", `  FAILED: ${err instanceof Error ? err.message : err}`);
+    }
+
+    // ── Test 8: databaseQueryLocal ──────────────────────────────
+    log("TEST", "8/8  databaseQueryLocal...");
     try {
       const p = waitForEvent(client, "station database query local", sn, QUERY_TIMEOUT);
       station.databaseQueryLocal(stationDevices, dayStart, dayEnd);

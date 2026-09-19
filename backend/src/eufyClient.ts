@@ -7,6 +7,9 @@ import {
   DatabaseReturnCode,
   DatabaseQueryLocal,
   DatabaseQueryByDate,
+  DatabaseCountByDate,
+  DatabaseQueryLatestInfo,
+  FilterStorageType,
 } from "eufy-security-client";
 import { Readable } from "stream";
 import { spawn, ChildProcess } from "child_process";
@@ -317,10 +320,47 @@ export class EufyService {
 
     const station = await this.client!.getStation(stationSN);
 
-    // Try databaseQueryByDate first (count: 100, better for bulk), fall back to databaseQueryLocal
-    let events = await this.tryDatabaseQueryByDate(station, stationSN, deviceSerialNumber, deviceName, from, to);
-    if (events.length > 0) return events;
+    // Get all camera serial numbers on this station for broader queries
+    const allCameraSNs = devices
+      .filter((d) => d.isCamera() && d.getStationSerial() === stationSN)
+      .map((d) => d.getSerial());
 
+    // Strategy: try databaseQueryByDate with several parameter variations,
+    // then fall back to databaseQueryLocal.
+    // Some HomeBase firmware (e.g. S380/HB3) returns 0 records with default
+    // parameters but works with explicit LOCAL storage type.
+
+    // Attempt 1: explicit LOCAL storage type with target device
+    let events = await this.tryDatabaseQueryByDate(
+      station, stationSN, [deviceSerialNumber], deviceName, from, to,
+      FilterStorageType.LOCAL
+    );
+    if (events.length > 0) return events.filter((e) => e.deviceSerialNumber === deviceSerialNumber);
+
+    // Attempt 2: default storage type (storage_cloud: -1) with target device
+    events = await this.tryDatabaseQueryByDate(
+      station, stationSN, [deviceSerialNumber], deviceName, from, to,
+      FilterStorageType.NONE
+    );
+    if (events.length > 0) return events.filter((e) => e.deviceSerialNumber === deviceSerialNumber);
+
+    // Attempt 3: LOCAL storage with ALL cameras on the station
+    if (allCameraSNs.length > 1) {
+      logger.info({ stationSN, cameras: allCameraSNs }, "Trying with all station cameras");
+      events = await this.tryDatabaseQueryByDate(
+        station, stationSN, allCameraSNs, deviceName, from, to,
+        FilterStorageType.LOCAL
+      );
+      if (events.length > 0) return events.filter((e) => e.deviceSerialNumber === deviceSerialNumber);
+    }
+
+    // Attempt 4: raw P2P command with no device filtering and storage_cloud=1
+    events = await this.tryRawDatabaseQuery(
+      station, stationSN, allCameraSNs, deviceName, from, to
+    );
+    if (events.length > 0) return events.filter((e) => e.deviceSerialNumber === deviceSerialNumber);
+
+    // Attempt 5: databaseQueryLocal
     events = await this.tryDatabaseQueryLocal(station, stationSN, deviceSerialNumber, deviceName, from, to);
     return events;
   }
@@ -343,13 +383,17 @@ export class EufyService {
   private async tryDatabaseQueryByDate(
     station: Station,
     stationSN: string,
-    deviceSN: string,
+    deviceSNs: string[],
     deviceName: string,
     from: Date,
-    to: Date
+    to: Date,
+    storageType: FilterStorageType = FilterStorageType.NONE
   ): Promise<EventRecord[]> {
     try {
-      logger.info({ stationSN, deviceSN }, "Trying databaseQueryByDate (P2P)");
+      logger.info(
+        { stationSN, deviceSNs, storageType, from: from.toISOString(), to: to.toISOString() },
+        "Trying databaseQueryByDate (P2P)"
+      );
       const records = await new Promise<DatabaseQueryByDate[]>((resolve, reject) => {
         const timeout = setTimeout(() => {
           this.client!.removeListener("station database query by date", handler);
@@ -373,34 +417,139 @@ export class EufyService {
         };
 
         this.client!.on("station database query by date", handler);
-        station.databaseQueryByDate([deviceSN], from, to);
+        station.databaseQueryByDate(deviceSNs, from, to, 0, 0, storageType);
       });
 
-      logger.info({ count: records.length }, "databaseQueryByDate returned records");
+      logger.info(
+        { count: records.length, storageType },
+        "databaseQueryByDate returned records"
+      );
 
-      return records
-        .filter((r) => r.device_sn === deviceSN)
-        .map((r) => ({
-          id: `local_${r.record_id}`,
-          deviceSerialNumber: r.device_sn,
-          deviceName,
-          stationSerialNumber: r.station_sn,
-          storagePath: r.storage_path,
-          hevcStoragePath: "",
-          cipherId: r.cipher_id,
-          startTime: Math.trunc(r.start_time.getTime() / 1000),
-          endTime: Math.trunc(r.end_time.getTime() / 1000),
-          thumbPath: r.thumb_path,
-          hasHuman: false,
-          videoType: r.video_type as number,
-        }));
+      return records.map((r) => ({
+        id: `local_${r.record_id}`,
+        deviceSerialNumber: r.device_sn,
+        deviceName,
+        stationSerialNumber: r.station_sn,
+        storagePath: r.storage_path,
+        hevcStoragePath: "",
+        cipherId: r.cipher_id,
+        startTime: Math.trunc(r.start_time.getTime() / 1000),
+        endTime: Math.trunc(r.end_time.getTime() / 1000),
+        thumbPath: r.thumb_path,
+        hasHuman: false,
+        videoType: r.video_type as number,
+      }));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("not implemented") || msg.includes("not supported")) {
         logger.warn({ stationSN }, "databaseQueryByDate not supported by this station");
       } else {
-        logger.warn({ err, stationSN }, "databaseQueryByDate failed");
+        logger.warn({ err, stationSN, storageType }, "databaseQueryByDate failed");
       }
+      return [];
+    }
+  }
+
+  private formatDateYYYYMMDD(date: Date): string {
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, "0");
+    const d = String(date.getDate()).padStart(2, "0");
+    return `${y}${m}${d}`;
+  }
+
+  private async tryRawDatabaseQuery(
+    station: Station,
+    stationSN: string,
+    deviceSNs: string[],
+    deviceName: string,
+    from: Date,
+    to: Date
+  ): Promise<EventRecord[]> {
+    try {
+      logger.info({ stationSN, deviceSNs }, "Trying raw P2P databaseQueryByDate with modified params");
+
+      const p2pSession = (station as any).p2pSession;
+      const rawStation = (station as any).rawStation;
+      if (!p2pSession || !rawStation) {
+        logger.warn({ stationSN }, "Cannot access P2P session internals");
+        return [];
+      }
+
+      const startDateStr = this.formatDateYYYYMMDD(from);
+      const endDateStr = this.formatDateYYYYMMDD(to);
+
+      const records = await new Promise<DatabaseQueryByDate[]>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          this.client!.removeListener("station database query by date", handler);
+          reject(new Error("raw databaseQueryByDate timed out"));
+        }, LOCAL_QUERY_TIMEOUT_MS);
+
+        const handler = (
+          eventStation: Station,
+          returnCode: DatabaseReturnCode,
+          data: DatabaseQueryByDate[]
+        ) => {
+          if (eventStation.getSerial() !== stationSN) return;
+          clearTimeout(timeout);
+          this.client!.removeListener("station database query by date", handler);
+          if (returnCode !== DatabaseReturnCode.SUCCESSFUL) {
+            reject(new Error(`raw databaseQueryByDate failed (code: ${returnCode})`));
+            return;
+          }
+          resolve(data);
+        };
+
+        this.client!.on("station database query by date", handler);
+
+        const devices = deviceSNs.map((sn) => ({ device_sn: sn }));
+        p2pSession.sendCommandWithStringPayload({
+          commandType: 1350,
+          value: JSON.stringify({
+            account_id: rawStation.member.admin_user_id,
+            cmd: 1306,
+            mChannel: 0,
+            mValue3: 0,
+            payload: {
+              cmd: 10006,
+              payload: {
+                count: 500,
+                detection_type: 0,
+                device_info: devices,
+                end_date: endDateStr,
+                event_type: 0,
+                flag: 0,
+                res_unzip: 1,
+                start_date: startDateStr,
+                start_time: `${startDateStr}000000`,
+                storage_cloud: 1,
+                ai_type: -1,
+              },
+              table: "history_record_info",
+              transaction: `${Date.now()}`,
+            },
+          }),
+          channel: 0,
+        });
+      });
+
+      logger.info({ count: records.length }, "raw databaseQueryByDate returned records");
+
+      return records.map((r) => ({
+        id: `local_${r.record_id}`,
+        deviceSerialNumber: r.device_sn,
+        deviceName,
+        stationSerialNumber: r.station_sn,
+        storagePath: r.storage_path,
+        hevcStoragePath: "",
+        cipherId: r.cipher_id,
+        startTime: Math.trunc(r.start_time.getTime() / 1000),
+        endTime: Math.trunc(r.end_time.getTime() / 1000),
+        thumbPath: r.thumb_path,
+        hasHuman: false,
+        videoType: r.video_type as number,
+      }));
+    } catch (err) {
+      logger.warn({ err, stationSN }, "raw databaseQueryByDate failed");
       return [];
     }
   }
