@@ -1,4 +1,14 @@
 @echo off
+
+:: ── Keep window open on errors: re-launch with cmd /k if double-clicked ──
+:: When double-clicked from Explorer, %cmdcmdline% contains the full path
+:: wrapped in quotes with /c. We re-launch with /k so the window stays open.
+echo %cmdcmdline% | findstr /i /c:"/c" >nul 2>&1
+if %errorlevel% equ 0 (
+    cmd /k "%~f0" %*
+    exit /b
+)
+
 setlocal enabledelayedexpansion
 chcp 65001 >nul 2>&1
 title Eufy Bulk Downloader
@@ -34,13 +44,10 @@ if errorlevel 1 (
     set NEED_FFMPEG=1
 )
 
-:: ── Prompt to auto-install if anything is missing ────────────────
-if !NEED_NODE! equ 1 if !NEED_FFMPEG! equ 0 goto :prompt_install
-if !NEED_NODE! equ 0 if !NEED_FFMPEG! equ 1 goto :prompt_install
-if !NEED_NODE! equ 1 if !NEED_FFMPEG! equ 1 goto :prompt_install
-goto :skip_install
+:: ── If nothing is missing, skip to verification ─────────────────
+if !NEED_NODE! equ 0 if !NEED_FFMPEG! equ 0 goto :skip_install
 
-:prompt_install
+:: ── Show what's missing and offer to install ─────────────────────
 echo [!!]   Some dependencies are missing.
 echo        This script can automatically install them for you:
 echo.
@@ -70,6 +77,8 @@ if errorlevel 1 (
     if !NEED_NODE! equ 1 echo           Node.js: https://nodejs.org/
     if !NEED_FFMPEG! equ 1 echo           FFmpeg:  https://www.gyan.dev/ffmpeg/builds/
     echo.
+    echo         After installing, close this window and double-click run.bat again.
+    echo.
     pause
     exit /b 1
 )
@@ -78,8 +87,10 @@ echo   Installer: winget ^(Windows Package Manager^)
 echo.
 set /p INSTALL_ANSWER="Install missing dependencies automatically? [Y/n] "
 if /i "!INSTALL_ANSWER!"=="n" (
+    echo.
     echo [ERROR] Cannot continue without required dependencies.
     echo         Install them manually and re-run this script.
+    echo.
     pause
     exit /b 1
 )
@@ -89,10 +100,13 @@ echo.
 :: ── Install Node.js via winget ───────────────────────────────────
 if !NEED_NODE! equ 1 (
     echo [INFO]  Installing Node.js 22 LTS via winget...
+    echo         This may take a minute...
     winget install OpenJS.NodeJS.LTS --accept-source-agreements --accept-package-agreements
     if errorlevel 1 (
+        echo.
         echo [ERROR] Node.js installation failed.
         echo         Please install manually: https://nodejs.org/
+        echo.
         pause
         exit /b 1
     )
@@ -103,23 +117,27 @@ if !NEED_NODE! equ 1 (
     for /f "tokens=2*" %%A in ('reg query "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" /v Path 2^>nul') do set "SYS_PATH=%%B"
     for /f "tokens=2*" %%A in ('reg query "HKCU\Environment" /v Path 2^>nul') do set "USR_PATH=%%B"
     set "PATH=!SYS_PATH!;!USR_PATH!"
+    echo.
 )
 
 :: ── Install FFmpeg via winget ────────────────────────────────────
 if !NEED_FFMPEG! equ 1 (
     echo [INFO]  Installing FFmpeg via winget...
+    echo         This may take a minute...
     winget install Gyan.FFmpeg --accept-source-agreements --accept-package-agreements
     if errorlevel 1 (
         echo [WARN]  FFmpeg installation via winget failed.
-        echo [WARN]  Trying alternative package...
+        echo [INFO]  Trying alternative package...
         winget install FFmpeg.FFmpeg --accept-source-agreements --accept-package-agreements
         if errorlevel 1 (
+            echo.
             echo [WARN]  FFmpeg auto-install failed.
             echo [WARN]  Downloads will not work without FFmpeg.
             echo         Install manually: https://www.gyan.dev/ffmpeg/builds/
             echo.
             set /p CONTINUE_NO_FF="Continue without FFmpeg? [y/N] "
             if /i not "!CONTINUE_NO_FF!"=="y" (
+                pause
                 exit /b 1
             )
         ) else (
@@ -134,9 +152,8 @@ if !NEED_FFMPEG! equ 1 (
     for /f "tokens=2*" %%A in ('reg query "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" /v Path 2^>nul') do set "SYS_PATH=%%B"
     for /f "tokens=2*" %%A in ('reg query "HKCU\Environment" /v Path 2^>nul') do set "USR_PATH=%%B"
     set "PATH=!SYS_PATH!;!USR_PATH!"
+    echo.
 )
-
-echo.
 
 :skip_install
 
@@ -145,8 +162,11 @@ echo [INFO]  Verifying dependencies...
 
 where node >nul 2>&1
 if errorlevel 1 (
+    echo.
     echo [ERROR] Node.js is still not available.
-    echo         You may need to close and reopen this terminal after installation.
+    echo         If you just installed it, you may need to close this window
+    echo         and double-click run.bat again so the new PATH takes effect.
+    echo.
     pause
     exit /b 1
 )
@@ -156,8 +176,11 @@ set NODE_MAJOR=!NODE_TAG:~1!
 for /f "tokens=*" %%v in ('node -v') do set NODE_FULL=%%v
 
 if !NODE_MAJOR! lss 20 (
+    echo.
     echo [ERROR] Node.js 20+ is required ^(found !NODE_FULL!^)
-    echo         You may need to close and reopen this terminal after installation.
+    echo         If you just installed a newer version, close this window
+    echo         and double-click run.bat again so the new PATH takes effect.
+    echo.
     pause
     exit /b 1
 )
@@ -165,8 +188,11 @@ echo [OK]    Node.js !NODE_FULL!
 
 where npm >nul 2>&1
 if errorlevel 1 (
+    echo.
     echo [ERROR] npm is not available.
-    echo         You may need to close and reopen this terminal after installation.
+    echo         If you just installed Node.js, close this window
+    echo         and double-click run.bat again so the new PATH takes effect.
+    echo.
     pause
     exit /b 1
 )
@@ -184,6 +210,7 @@ set "ENV_FILE=%~dp0backend\.env"
 set "ENV_EXAMPLE=%~dp0backend\.env.example"
 
 if not exist "!ENV_FILE!" (
+    echo.
     echo [INFO]  No backend\.env file found.
     if exist "!ENV_EXAMPLE!" (
         copy "!ENV_EXAMPLE!" "!ENV_FILE!" >nul
@@ -202,42 +229,74 @@ if not exist "!ENV_FILE!" (
         echo [OK]    Created backend\.env with defaults
     )
 
+    echo.
     echo [WARN]  Please edit backend\.env with your Eufy credentials.
+    echo         At minimum, set EUFY_EMAIL and EUFY_PASSWORD.
     echo.
     set /p OPENNOW="Open backend\.env in Notepad now? [Y/n] "
     if /i not "!OPENNOW!"=="n" (
         notepad "!ENV_FILE!"
     )
+    echo.
+    echo         Press any key when you have saved your credentials...
+    pause >nul
 ) else (
     echo [OK]    backend\.env exists
 )
 
-:: ── Install dependencies ──────────────────────────────────────────
+:: ── Install npm dependencies ──────────────────────────────────────
 echo.
 echo [INFO]  Installing root dependencies...
 call npm install --silent >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] Root npm install failed. See errors above.
+    pause
+    exit /b 1
+)
 echo [OK]    Root dependencies installed
 
 echo [INFO]  Installing backend dependencies...
 pushd backend
 call npm install --silent >nul 2>&1
+if errorlevel 1 (
+    popd
+    echo [ERROR] Backend npm install failed. See errors above.
+    pause
+    exit /b 1
+)
 popd
 echo [OK]    Backend dependencies installed
 
 echo [INFO]  Installing frontend dependencies...
 pushd frontend
 call npm install --silent >nul 2>&1
+if errorlevel 1 (
+    popd
+    echo [ERROR] Frontend npm install failed. See errors above.
+    pause
+    exit /b 1
+)
 popd
 echo [OK]    Frontend dependencies installed
 
 :: ── Start servers ─────────────────────────────────────────────────
 echo.
-echo [INFO]  Starting backend and frontend...
-echo         Backend  -^> http://localhost:3001
-echo         Frontend -^> http://localhost:5173
+echo ======================================
+echo    All ready! Starting servers...
+echo ======================================
+echo.
+echo    Backend  -^> http://localhost:3001
+echo    Frontend -^> http://localhost:5173
+echo.
+echo    Press Ctrl+C to stop.
 echo.
 
 :: Open browser after a short delay
 start "" cmd /c "timeout /t 3 /nobreak >nul && start http://localhost:5173"
 
 call npm run dev
+
+:: If npm run dev exits (shouldn't normally), keep window open
+echo.
+echo [INFO]  Servers have stopped.
+pause
