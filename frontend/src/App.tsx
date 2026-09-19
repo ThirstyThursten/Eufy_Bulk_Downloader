@@ -201,8 +201,20 @@ export default function App() {
 
           {/* Error display */}
           {error && (
-            <div className="card">
+            <div className="card" style={{ borderLeft: "4px solid #dc3545" }}>
               <p className="error-text">{error}</p>
+            </div>
+          )}
+
+          {/* Empty state after loading */}
+          {!loading && !error && events.length === 0 && (from || to) && (
+            <div className="card" style={{ borderLeft: "4px solid #ffc107" }}>
+              <p><strong>No events found</strong> for the selected time range.</p>
+              <p style={{ fontSize: "0.9em", marginTop: "0.5rem", color: "#666" }}>
+                The app queries both the Eufy cloud and your HomeBase local storage.
+                Check the backend terminal for details. Make sure the date range
+                matches events you can see in the Eufy app.
+              </p>
             </div>
           )}
 
