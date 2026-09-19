@@ -111,7 +111,13 @@ export function createApp(
         return;
       }
 
-      logger.info({ deviceId: query.deviceId, from: from.toISOString(), to: to.toISOString() }, "Fetching events");
+      logger.info({
+        deviceId: query.deviceId,
+        from: from.toISOString(),
+        to: to.toISOString(),
+        fromLocal: from.toLocaleString(),
+        toLocal: to.toLocaleString(),
+      }, "Fetching events");
       const events = await eufyService.getEvents(query.deviceId, from, to);
       logger.info({ deviceId: query.deviceId, count: events.length }, "Events fetched");
       res.json({ events });

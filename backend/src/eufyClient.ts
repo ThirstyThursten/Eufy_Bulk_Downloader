@@ -6,6 +6,7 @@ import {
   LoginOptions,
   DatabaseReturnCode,
   DatabaseQueryLocal,
+  DatabaseQueryByDate,
 } from "eufy-security-client";
 import { Readable } from "stream";
 import { spawn, ChildProcess } from "child_process";
@@ -58,7 +59,8 @@ export interface CaptchaInfo {
   imageBase64: string;
 }
 
-const LOCAL_QUERY_TIMEOUT_MS = 30_000;
+const LOCAL_QUERY_TIMEOUT_MS = 60_000;
+const P2P_SETTLE_DELAY_MS = 2_000;
 
 export class EufyService {
   private client: EufySecurity | null = null;
@@ -244,13 +246,18 @@ export class EufyService {
 
     // --- Fall back to local HomeBase query via P2P ---
     logger.info("Cloud returned zero events, querying HomeBase local storage via P2P");
-    const localEvents = await this.getLocalEvents(deviceSerialNumber, from, to);
-    if (localEvents.length > 0) {
-      logger.info({ count: localEvents.length }, "Found events on HomeBase local storage");
-    } else {
-      logger.warn({ deviceSN: deviceSerialNumber }, "No events found via cloud or local query");
+    try {
+      const localEvents = await this.getLocalEvents(deviceSerialNumber, from, to);
+      if (localEvents.length > 0) {
+        logger.info({ count: localEvents.length }, "Found events on HomeBase local storage");
+      } else {
+        logger.warn({ deviceSN: deviceSerialNumber }, "No events found via cloud or local query");
+      }
+      return localEvents;
+    } catch (err) {
+      logger.error({ err }, "Local HomeBase query failed");
+      return [];
     }
-    return localEvents;
   }
 
   private async getCloudEvents(
@@ -301,76 +308,169 @@ export class EufyService {
     const deviceName = device.getName();
 
     // Ensure the station is connected via P2P
-    const stationConnected = await this.client!.isStationConnected(stationSN);
-    if (!stationConnected) {
-      logger.info({ stationSN }, "Connecting to station via P2P...");
-      try {
-        await this.client!.connectToStation(stationSN);
-        logger.info({ stationSN }, "P2P connection established");
-      } catch (err) {
-        logger.error({ err, stationSN }, "Failed to connect to station via P2P");
-        return [];
-      }
+    try {
+      await this.ensureStationP2P(stationSN);
+    } catch (err) {
+      logger.error({ err, stationSN }, "Cannot establish P2P connection to station");
+      return [];
     }
 
     const station = await this.client!.getStation(stationSN);
 
-    // databaseQueryLocal is event-based — wrap in a promise
-    const records = await new Promise<DatabaseQueryLocal[]>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.client!.removeListener("station database query local", handler);
-        reject(new Error("Local database query timed out"));
-      }, LOCAL_QUERY_TIMEOUT_MS);
+    // Try databaseQueryByDate first (count: 100, better for bulk), fall back to databaseQueryLocal
+    let events = await this.tryDatabaseQueryByDate(station, stationSN, deviceSerialNumber, deviceName, from, to);
+    if (events.length > 0) return events;
 
-      const handler = (
-        eventStation: Station,
-        returnCode: DatabaseReturnCode,
-        data: DatabaseQueryLocal[]
-      ) => {
-        if (eventStation.getSerial() !== stationSN) return;
+    events = await this.tryDatabaseQueryLocal(station, stationSN, deviceSerialNumber, deviceName, from, to);
+    return events;
+  }
 
-        clearTimeout(timeout);
-        this.client!.removeListener("station database query local", handler);
+  private async ensureStationP2P(stationSN: string): Promise<void> {
+    const connected = await this.client!.isStationConnected(stationSN);
+    if (connected) {
+      logger.info({ stationSN }, "Station already P2P connected");
+      return;
+    }
 
-        if (returnCode !== DatabaseReturnCode.SUCCESSFUL) {
-          reject(new Error(`Local database query failed (code: ${returnCode})`));
-          return;
-        }
-        resolve(data);
-      };
+    logger.info({ stationSN }, "Connecting to station via P2P...");
+    await this.client!.connectToStation(stationSN);
 
-      this.client!.on("station database query local", handler);
+    // Give the P2P session time to fully stabilize
+    await new Promise((r) => setTimeout(r, P2P_SETTLE_DELAY_MS));
+    logger.info({ stationSN }, "P2P connection established");
+  }
 
-      logger.info(
-        { stationSN, deviceSN: deviceSerialNumber, from: from.toISOString(), to: to.toISOString() },
-        "Sending databaseQueryLocal command"
-      );
-      station.databaseQueryLocal([deviceSerialNumber], from, to);
-    });
+  private async tryDatabaseQueryByDate(
+    station: Station,
+    stationSN: string,
+    deviceSN: string,
+    deviceName: string,
+    from: Date,
+    to: Date
+  ): Promise<EventRecord[]> {
+    try {
+      logger.info({ stationSN, deviceSN }, "Trying databaseQueryByDate (P2P)");
+      const records = await new Promise<DatabaseQueryByDate[]>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          this.client!.removeListener("station database query by date", handler);
+          reject(new Error("databaseQueryByDate timed out"));
+        }, LOCAL_QUERY_TIMEOUT_MS);
 
-    logger.info({ count: records.length }, "Local database query returned records");
+        const handler = (
+          eventStation: Station,
+          returnCode: DatabaseReturnCode,
+          data: DatabaseQueryByDate[]
+        ) => {
+          if (eventStation.getSerial() !== stationSN) return;
+          clearTimeout(timeout);
+          this.client!.removeListener("station database query by date", handler);
 
-    return records
-      .filter((r) => r.device_sn === deviceSerialNumber || !r.device_sn)
-      .map((r) => {
-        const h = r.history;
-        const startEpoch = Math.trunc(h.start_time.getTime() / 1000);
-        const endEpoch = Math.trunc(h.end_time.getTime() / 1000);
-        return {
+          if (returnCode !== DatabaseReturnCode.SUCCESSFUL) {
+            reject(new Error(`databaseQueryByDate failed (code: ${returnCode})`));
+            return;
+          }
+          resolve(data);
+        };
+
+        this.client!.on("station database query by date", handler);
+        station.databaseQueryByDate([deviceSN], from, to);
+      });
+
+      logger.info({ count: records.length }, "databaseQueryByDate returned records");
+
+      return records
+        .filter((r) => r.device_sn === deviceSN)
+        .map((r) => ({
           id: `local_${r.record_id}`,
-          deviceSerialNumber: r.device_sn ?? deviceSerialNumber,
+          deviceSerialNumber: r.device_sn,
           deviceName,
           stationSerialNumber: r.station_sn,
-          storagePath: h.storage_path,
+          storagePath: r.storage_path,
           hevcStoragePath: "",
-          cipherId: h.cipher_id,
-          startTime: startEpoch,
-          endTime: endEpoch,
-          thumbPath: h.thumb_path,
+          cipherId: r.cipher_id,
+          startTime: Math.trunc(r.start_time.getTime() / 1000),
+          endTime: Math.trunc(r.end_time.getTime() / 1000),
+          thumbPath: r.thumb_path,
           hasHuman: false,
-          videoType: h.video_type as number,
+          videoType: r.video_type as number,
+        }));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("not implemented") || msg.includes("not supported")) {
+        logger.warn({ stationSN }, "databaseQueryByDate not supported by this station");
+      } else {
+        logger.warn({ err, stationSN }, "databaseQueryByDate failed");
+      }
+      return [];
+    }
+  }
+
+  private async tryDatabaseQueryLocal(
+    station: Station,
+    stationSN: string,
+    deviceSN: string,
+    deviceName: string,
+    from: Date,
+    to: Date
+  ): Promise<EventRecord[]> {
+    try {
+      logger.info({ stationSN, deviceSN }, "Trying databaseQueryLocal (P2P)");
+      const records = await new Promise<DatabaseQueryLocal[]>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          this.client!.removeListener("station database query local", handler);
+          reject(new Error("databaseQueryLocal timed out"));
+        }, LOCAL_QUERY_TIMEOUT_MS);
+
+        const handler = (
+          eventStation: Station,
+          returnCode: DatabaseReturnCode,
+          data: DatabaseQueryLocal[]
+        ) => {
+          if (eventStation.getSerial() !== stationSN) return;
+          clearTimeout(timeout);
+          this.client!.removeListener("station database query local", handler);
+
+          if (returnCode !== DatabaseReturnCode.SUCCESSFUL) {
+            reject(new Error(`databaseQueryLocal failed (code: ${returnCode})`));
+            return;
+          }
+          resolve(data);
         };
+
+        this.client!.on("station database query local", handler);
+        station.databaseQueryLocal([deviceSN], from, to);
       });
+
+      logger.info({ count: records.length }, "databaseQueryLocal returned records");
+
+      return records
+        .filter((r) => r.device_sn === deviceSN || !r.device_sn)
+        .map((r) => {
+          const h = r.history;
+          return {
+            id: `local_${r.record_id}`,
+            deviceSerialNumber: r.device_sn ?? deviceSN,
+            deviceName,
+            stationSerialNumber: r.station_sn,
+            storagePath: h.storage_path,
+            hevcStoragePath: "",
+            cipherId: h.cipher_id,
+            startTime: Math.trunc(h.start_time.getTime() / 1000),
+            endTime: Math.trunc(h.end_time.getTime() / 1000),
+            thumbPath: h.thumb_path,
+            hasHuman: false,
+            videoType: h.video_type as number,
+          };
+        });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("not implemented") || msg.includes("not supported")) {
+        logger.warn({ stationSN }, "databaseQueryLocal not supported by this station");
+      } else {
+        logger.warn({ err, stationSN }, "databaseQueryLocal failed");
+      }
+      return [];
+    }
   }
 
   async downloadEvent(event: EventRecord, outputPath: string): Promise<void> {
