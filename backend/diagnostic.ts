@@ -1,0 +1,249 @@
+/**
+ * Diagnostic script — run while the app is NOT running (they share the Eufy session).
+ *
+ *   cd backend
+ *   npx ts-node diagnostic.ts
+ *
+ * It connects to Eufy, lists your devices/stations, checks P2P connectivity,
+ * and tries every database query method against each station. Paste the full
+ * output when reporting issues.
+ */
+import * as dotenv from "dotenv";
+import * as path from "path";
+import * as fs from "fs";
+import {
+  EufySecurity,
+  EufySecurityConfig,
+  Station,
+  DatabaseReturnCode,
+  LoginOptions,
+} from "eufy-security-client";
+
+dotenv.config();
+
+const QUERY_TIMEOUT = 30_000;
+
+function log(label: string, ...args: unknown[]) {
+  const ts = new Date().toLocaleString();
+  console.log(`[${ts}] [${label}]`, ...args);
+}
+
+async function waitForEvent<T>(
+  client: EufySecurity,
+  eventName: string,
+  stationSN: string,
+  timeoutMs: number
+): Promise<{ returnCode: number; data: T }> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      (client as any).removeListener(eventName, handler);
+      reject(new Error(`Event "${eventName}" timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    const handler = (station: Station, returnCode: number, data: T) => {
+      if (station.getSerial() !== stationSN) return;
+      clearTimeout(timer);
+      (client as any).removeListener(eventName, handler);
+      resolve({ returnCode, data });
+    };
+
+    (client as any).on(eventName, handler);
+  });
+}
+
+async function main() {
+  const email = process.env.EUFY_EMAIL;
+  const password = process.env.EUFY_PASSWORD;
+  if (!email || !password) {
+    console.error("Set EUFY_EMAIL and EUFY_PASSWORD in backend/.env");
+    process.exit(1);
+  }
+
+  const persistentDir = path.resolve(__dirname, "persistent");
+  if (!fs.existsSync(persistentDir)) fs.mkdirSync(persistentDir, { recursive: true });
+
+  const config: EufySecurityConfig = {
+    username: email,
+    password: password,
+    country: process.env.EUFY_COUNTRY || "US",
+    language: "en",
+    persistentDir,
+    p2pConnectionSetup: parseInt(process.env.P2P_CONNECTION_SETUP || "0", 10),
+    pollingIntervalMinutes: 10,
+    eventDurationSeconds: 10,
+  };
+
+  const sessionPath = path.join(persistentDir, "session.json");
+  if (fs.existsSync(sessionPath)) {
+    config.persistentData = fs.readFileSync(sessionPath, "utf-8");
+  }
+
+  log("INIT", "Connecting to Eufy Security...");
+
+  const client = await EufySecurity.initialize(config);
+
+  let needTfa = false;
+  client.on("tfa request", () => {
+    needTfa = true;
+    log("AUTH", "2FA code required — enter it in the Eufy app or re-run after the main app handles 2FA");
+  });
+
+  try {
+    await client.connect();
+  } catch {
+    if (needTfa) {
+      log("AUTH", "Cannot continue without 2FA. Run the main app first to complete login, then re-run this script.");
+      client.close();
+      process.exit(1);
+    }
+    throw new Error("Connection failed");
+  }
+
+  log("AUTH", "Connected successfully");
+
+  // ── Devices ──────────────────────────────────────────────────────
+  log("DEVICES", "=== Cameras ===");
+  const devices = await client.getDevices();
+  for (const d of devices) {
+    if (!d.isCamera()) continue;
+    log("DEVICES", {
+      name: d.getName(),
+      serial: d.getSerial(),
+      model: d.getModel(),
+      type: d.getDeviceType(),
+      stationSN: d.getStationSerial(),
+      firmware: d.getSoftwareVersion(),
+    });
+  }
+
+  // ── Stations ─────────────────────────────────────────────────────
+  log("STATIONS", "=== Stations / HomeBases ===");
+  const stations = await client.getStations();
+  for (const s of stations) {
+    log("STATIONS", {
+      name: s.getName(),
+      serial: s.getSerial(),
+      model: s.getModel(),
+      type: s.getDeviceType(),
+      firmware: s.getSoftwareVersion(),
+      connected: s.isConnected(),
+    });
+  }
+
+  // ── P2P probe per station ────────────────────────────────────────
+  for (const station of stations) {
+    const sn = station.getSerial();
+    log("P2P", `\n━━━ Station: ${station.getName()} (${sn}) ━━━`);
+
+    // Connect P2P
+    const alreadyConnected = station.isConnected();
+    if (!alreadyConnected) {
+      log("P2P", "Connecting via P2P...");
+      try {
+        await client.connectToStation(sn);
+        await new Promise((r) => setTimeout(r, 3000));
+        log("P2P", "P2P connected");
+      } catch (err) {
+        log("P2P", "P2P connection FAILED:", err instanceof Error ? err.message : err);
+        continue;
+      }
+    } else {
+      log("P2P", "Already P2P connected");
+    }
+
+    // Get camera serial numbers for this station
+    const stationDevices = devices
+      .filter((d) => d.isCamera() && d.getStationSerial() === sn)
+      .map((d) => d.getSerial());
+
+    log("P2P", `Cameras on this station: ${stationDevices.join(", ") || "(none)"}`);
+
+    // Use yesterday as the test date range
+    const now = new Date();
+    const dayEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59);
+    const dayStart = new Date(dayEnd.getTime() - 24 * 60 * 60 * 1000);
+    log("P2P", `Test date range: ${dayStart.toLocaleString()} → ${dayEnd.toLocaleString()}`);
+
+    // ── Test 1: databaseQueryLatestInfo ─────────────────────────
+    log("TEST", "1/3  databaseQueryLatestInfo...");
+    try {
+      const p = waitForEvent(client, "station database query latest", sn, QUERY_TIMEOUT);
+      station.databaseQueryLatestInfo();
+      const result = await p;
+      log("TEST", `  Result: code=${result.returnCode}, records=${Array.isArray(result.data) ? result.data.length : "?"}`);
+      if (Array.isArray(result.data)) {
+        for (const entry of result.data) {
+          log("TEST", "  ", entry);
+        }
+      }
+    } catch (err) {
+      log("TEST", `  FAILED: ${err instanceof Error ? err.message : err}`);
+    }
+
+    if (stationDevices.length === 0) {
+      log("TEST", "Skipping query tests — no cameras on this station");
+      continue;
+    }
+
+    // ── Test 2: databaseQueryByDate ─────────────────────────────
+    log("TEST", "2/3  databaseQueryByDate...");
+    try {
+      const p = waitForEvent(client, "station database query by date", sn, QUERY_TIMEOUT);
+      station.databaseQueryByDate(stationDevices, dayStart, dayEnd);
+      const result = await p;
+      log("TEST", `  Result: code=${result.returnCode}, records=${Array.isArray(result.data) ? result.data.length : "?"}`);
+      if (Array.isArray(result.data) && result.data.length > 0) {
+        log("TEST", "  First record:", result.data[0]);
+      }
+    } catch (err) {
+      log("TEST", `  FAILED: ${err instanceof Error ? err.message : err}`);
+    }
+
+    // ── Test 3: databaseQueryLocal ──────────────────────────────
+    log("TEST", "3/3  databaseQueryLocal...");
+    try {
+      const p = waitForEvent(client, "station database query local", sn, QUERY_TIMEOUT);
+      station.databaseQueryLocal(stationDevices, dayStart, dayEnd);
+      const result = await p;
+      log("TEST", `  Result: code=${result.returnCode}, records=${Array.isArray(result.data) ? result.data.length : "?"}`);
+      if (Array.isArray(result.data) && result.data.length > 0) {
+        log("TEST", "  First record:", result.data[0]);
+      }
+    } catch (err) {
+      log("TEST", `  FAILED: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  // ── Cloud API probe ──────────────────────────────────────────────
+  log("CLOUD", "\n━━━ Cloud API ━━━");
+  const now = new Date();
+  const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+  for (const d of devices) {
+    if (!d.isCamera()) continue;
+    const dSN = d.getSerial();
+    log("CLOUD", `Camera: ${d.getName()} (${dSN})`);
+
+    try {
+      const videoEvents = await client.getApi().getVideoEvents(yesterday, now, { deviceSN: dSN });
+      log("CLOUD", `  getVideoEvents: ${videoEvents.length} events`);
+    } catch (err) {
+      log("CLOUD", `  getVideoEvents FAILED: ${err instanceof Error ? err.message : err}`);
+    }
+
+    try {
+      const historyEvents = await client.getApi().getHistoryEvents(yesterday, now, { deviceSN: dSN });
+      log("CLOUD", `  getHistoryEvents: ${historyEvents.length} events`);
+    } catch (err) {
+      log("CLOUD", `  getHistoryEvents FAILED: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  log("DONE", "Diagnostic complete. Closing connection...");
+  client.close();
+}
+
+main().catch((err) => {
+  console.error("Fatal error:", err);
+  process.exit(1);
+});
