@@ -207,12 +207,13 @@ export function createApp(
    * Cancel a running download job.
    */
   app.post("/api/jobs/:jobId/cancel", (req: Request, res: Response) => {
-    const job = jobManager.getJob(req.params.jobId);
+    const jobId = req.params.jobId as string;
+    const job = jobManager.getJob(jobId);
     if (!job) {
       res.status(404).json({ error: "Job not found" });
       return;
     }
-    jobManager.cancelJob(req.params.jobId);
+    jobManager.cancelJob(jobId);
     res.json({ status: "cancelled" });
   });
 

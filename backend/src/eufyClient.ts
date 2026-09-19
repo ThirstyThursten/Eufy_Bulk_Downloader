@@ -4,6 +4,8 @@ import {
   Device,
   Station,
   LoginOptions,
+  DatabaseReturnCode,
+  DatabaseQueryLocal,
 } from "eufy-security-client";
 import { Readable } from "stream";
 import { spawn, ChildProcess } from "child_process";
@@ -56,17 +58,14 @@ export interface CaptchaInfo {
   imageBase64: string;
 }
 
-/**
- * Wrapper around eufy-security-client that isolates all Eufy API calls.
- * If the library or protocol changes, only this file needs updating.
- */
+const LOCAL_QUERY_TIMEOUT_MS = 30_000;
+
 export class EufyService {
   private client: EufySecurity | null = null;
   private _status: ConnectionStatus = "disconnected";
   private _captchaInfo: CaptchaInfo | null = null;
   private _errorMessage: string | null = null;
 
-  // Active download tracking: maps deviceSN to resolve/reject callbacks
   private activeDownloads = new Map<
     string,
     {
@@ -91,10 +90,6 @@ export class EufyService {
     return this._errorMessage;
   }
 
-  /**
-   * Initialize the EufySecurity client and attempt to connect.
-   * Call this once at startup.
-   */
   async initialize(): Promise<void> {
     const email = process.env.EUFY_EMAIL;
     const password = process.env.EUFY_PASSWORD;
@@ -124,7 +119,6 @@ export class EufyService {
       eventDurationSeconds: 10,
     };
 
-    // Restore persistent session data if available
     const sessionPath = path.join(persistentDir, "session.json");
     if (fs.existsSync(sessionPath)) {
       try {
@@ -141,18 +135,16 @@ export class EufyService {
 
     try {
       await this.client.connect();
-      // If connect() didn't trigger tfa/captcha events, we're connected
       if (this._status === "connecting") {
         this._status = "connected";
         this.savePersistentData();
         logger.info("Connected to Eufy Security");
       }
     } catch (err) {
-      // 2FA or captcha may have been triggered via events
-      if (
-        this._status !== "tfa_required" &&
-        this._status !== "captcha_required"
-      ) {
+      // Event listeners may have changed _status to tfa_required/captcha_required
+      // during connect() — only treat as error if they didn't.
+      const s = this._status as string;
+      if (s !== "tfa_required" && s !== "captcha_required") {
         this._status = "error";
         this._errorMessage =
           err instanceof Error ? err.message : "Unknown connection error";
@@ -161,9 +153,6 @@ export class EufyService {
     }
   }
 
-  /**
-   * Submit a 2FA verification code (from email/SMS).
-   */
   async submitTfaCode(code: string): Promise<void> {
     if (!this.client) throw new Error("Client not initialized");
 
@@ -181,9 +170,6 @@ export class EufyService {
     }
   }
 
-  /**
-   * Submit a captcha solution.
-   */
   async submitCaptcha(captchaId: string, captchaCode: string): Promise<void> {
     if (!this.client) throw new Error("Client not initialized");
 
@@ -203,9 +189,6 @@ export class EufyService {
     }
   }
 
-  /**
-   * Get all camera devices from the account.
-   */
   async getDevices(): Promise<SimpleDevice[]> {
     this.ensureConnected();
     const devices: Device[] = await this.client!.getDevices();
@@ -222,9 +205,6 @@ export class EufyService {
       }));
   }
 
-  /**
-   * Get all stations (base stations / hubs).
-   */
   async getStations(): Promise<SimpleStation[]> {
     this.ensureConnected();
     const stations: Station[] = await this.client!.getStations();
@@ -238,7 +218,10 @@ export class EufyService {
 
   /**
    * Fetch video events for a device within a time range.
-   * Uses the HTTP API to query the Eufy cloud for event records.
+   *
+   * Strategy: try the cloud API first (fast), then fall back to querying
+   * the HomeBase's local database via P2P, which is where most users'
+   * events actually live.
    */
   async getEvents(
     deviceSerialNumber: string,
@@ -249,26 +232,41 @@ export class EufyService {
 
     logger.info(
       { deviceSN: deviceSerialNumber, from: from.toISOString(), to: to.toISOString() },
-      "Querying Eufy cloud for video events"
+      "Fetching events"
     );
 
+    // --- Try cloud API first (quick HTTP calls) ---
+    const cloudEvents = await this.getCloudEvents(deviceSerialNumber, from, to);
+    if (cloudEvents.length > 0) {
+      logger.info({ count: cloudEvents.length }, "Found events via cloud API");
+      return cloudEvents;
+    }
+
+    // --- Fall back to local HomeBase query via P2P ---
+    logger.info("Cloud returned zero events, querying HomeBase local storage via P2P");
+    const localEvents = await this.getLocalEvents(deviceSerialNumber, from, to);
+    if (localEvents.length > 0) {
+      logger.info({ count: localEvents.length }, "Found events on HomeBase local storage");
+    } else {
+      logger.warn({ deviceSN: deviceSerialNumber }, "No events found via cloud or local query");
+    }
+    return localEvents;
+  }
+
+  private async getCloudEvents(
+    deviceSerialNumber: string,
+    from: Date,
+    to: Date
+  ): Promise<EventRecord[]> {
     const api = this.client!.getApi();
     const filter = { deviceSN: deviceSerialNumber };
 
     let events = await api.getVideoEvents(from, to, filter);
-    logger.info({ deviceSN: deviceSerialNumber, count: events.length }, "getVideoEvents result");
+    logger.info({ count: events.length }, "getVideoEvents result");
 
     if (events.length === 0) {
-      logger.info("Video records empty, trying history records endpoint");
       events = await api.getHistoryEvents(from, to, filter);
-      logger.info({ deviceSN: deviceSerialNumber, count: events.length }, "getHistoryEvents result");
-    }
-
-    if (events.length === 0) {
-      logger.warn(
-        { deviceSN: deviceSerialNumber },
-        "Both cloud endpoints returned zero events — events may only exist on local station storage"
-      );
+      logger.info({ count: events.length }, "getHistoryEvents result");
     }
 
     return events.map((e) => ({
@@ -287,19 +285,97 @@ export class EufyService {
     }));
   }
 
-  /**
-   * Download a single event video and save it as an MP4 file.
-   *
-   * The eufy-security-client provides raw H.264/H.265 video and raw AAC audio
-   * as Node.js Readable streams via the "station download start" event.
-   * We save these to temp files, then use FFmpeg to mux them into a proper MP4.
-   *
-   * The download is initiated via P2P connection to the station.
-   */
+  private async getLocalEvents(
+    deviceSerialNumber: string,
+    from: Date,
+    to: Date
+  ): Promise<EventRecord[]> {
+    const devices = await this.client!.getDevices();
+    const device = devices.find((d) => d.getSerial() === deviceSerialNumber);
+    if (!device) {
+      logger.error({ deviceSN: deviceSerialNumber }, "Device not found");
+      return [];
+    }
+
+    const stationSN = device.getStationSerial();
+    const deviceName = device.getName();
+
+    // Ensure the station is connected via P2P
+    const stationConnected = await this.client!.isStationConnected(stationSN);
+    if (!stationConnected) {
+      logger.info({ stationSN }, "Connecting to station via P2P...");
+      try {
+        await this.client!.connectToStation(stationSN);
+        logger.info({ stationSN }, "P2P connection established");
+      } catch (err) {
+        logger.error({ err, stationSN }, "Failed to connect to station via P2P");
+        return [];
+      }
+    }
+
+    const station = await this.client!.getStation(stationSN);
+
+    // databaseQueryLocal is event-based — wrap in a promise
+    const records = await new Promise<DatabaseQueryLocal[]>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.client!.removeListener("station database query local", handler);
+        reject(new Error("Local database query timed out"));
+      }, LOCAL_QUERY_TIMEOUT_MS);
+
+      const handler = (
+        eventStation: Station,
+        returnCode: DatabaseReturnCode,
+        data: DatabaseQueryLocal[]
+      ) => {
+        if (eventStation.getSerial() !== stationSN) return;
+
+        clearTimeout(timeout);
+        this.client!.removeListener("station database query local", handler);
+
+        if (returnCode !== DatabaseReturnCode.SUCCESSFUL) {
+          reject(new Error(`Local database query failed (code: ${returnCode})`));
+          return;
+        }
+        resolve(data);
+      };
+
+      this.client!.on("station database query local", handler);
+
+      logger.info(
+        { stationSN, deviceSN: deviceSerialNumber, from: from.toISOString(), to: to.toISOString() },
+        "Sending databaseQueryLocal command"
+      );
+      station.databaseQueryLocal([deviceSerialNumber], from, to);
+    });
+
+    logger.info({ count: records.length }, "Local database query returned records");
+
+    return records
+      .filter((r) => r.device_sn === deviceSerialNumber || !r.device_sn)
+      .map((r) => {
+        const h = r.history;
+        const startEpoch = Math.trunc(h.start_time.getTime() / 1000);
+        const endEpoch = Math.trunc(h.end_time.getTime() / 1000);
+        return {
+          id: `local_${r.record_id}`,
+          deviceSerialNumber: r.device_sn ?? deviceSerialNumber,
+          deviceName,
+          stationSerialNumber: r.station_sn,
+          storagePath: h.storage_path,
+          hevcStoragePath: "",
+          cipherId: h.cipher_id,
+          startTime: startEpoch,
+          endTime: endEpoch,
+          thumbPath: h.thumb_path,
+          hasHuman: false,
+          videoType: h.video_type as number,
+        };
+      });
+  }
+
   async downloadEvent(event: EventRecord, outputPath: string): Promise<void> {
     this.ensureConnected();
 
-    // Ensure output directory exists
     const dir = path.dirname(outputPath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -315,7 +391,6 @@ export class EufyService {
     const audioTempPath = path.join(tempDir, `audio_${timestamp}.aac`);
 
     return new Promise<void>((resolve, reject) => {
-      // Register this download so event handlers can find it
       this.activeDownloads.set(event.deviceSerialNumber, {
         resolve,
         reject,
@@ -325,8 +400,6 @@ export class EufyService {
         outputPath,
       });
 
-      // Initiate the P2P download
-      // The "station download start" event handler will receive the streams
       this.client!.startStationDownload(
         event.deviceSerialNumber,
         event.storagePath,
@@ -337,7 +410,6 @@ export class EufyService {
         reject(err);
       });
 
-      // Timeout after 5 minutes
       setTimeout(() => {
         if (this.activeDownloads.has(event.deviceSerialNumber)) {
           this.activeDownloads.delete(event.deviceSerialNumber);
@@ -348,9 +420,6 @@ export class EufyService {
     });
   }
 
-  /**
-   * Gracefully close the Eufy client connection.
-   */
   async close(): Promise<void> {
     if (this.client) {
       this.savePersistentData();
@@ -364,13 +433,11 @@ export class EufyService {
   private setupEventListeners(): void {
     if (!this.client) return;
 
-    // 2FA requested
     this.client.on("tfa request", () => {
       this._status = "tfa_required";
       logger.info("2FA verification code required - check your email/SMS");
     });
 
-    // Captcha requested
     this.client.on(
       "captcha request",
       (captchaId: string, captchaImageBase64: string) => {
@@ -380,14 +447,12 @@ export class EufyService {
       }
     );
 
-    // Connection established
     this.client.on("connect", () => {
       this._status = "connected";
       this.savePersistentData();
       logger.info("Eufy client connected");
     });
 
-    // Connection closed
     this.client.on("close", () => {
       if (this._status === "connected") {
         this._status = "disconnected";
@@ -395,18 +460,12 @@ export class EufyService {
       }
     });
 
-    // Connection error
     this.client.on("connection error", (error: Error) => {
       this._status = "error";
       this._errorMessage = error.message;
       logger.error({ error }, "Eufy connection error");
     });
 
-    /**
-     * Download started - receives raw video and audio streams.
-     * The video stream is raw H.264 (or H.265) and audio is raw AAC.
-     * We save them to temp files, then mux with FFmpeg when download finishes.
-     */
     this.client.on(
       "station download start",
       (
@@ -436,7 +495,6 @@ export class EufyService {
           "Download stream started"
         );
 
-        // Write raw streams to temp files
         const videoOut = fs.createWriteStream(download.videoTempPath);
         const audioOut = fs.createWriteStream(download.audioTempPath);
 
@@ -452,9 +510,6 @@ export class EufyService {
       }
     );
 
-    /**
-     * Download finished - mux the raw video/audio into MP4 using FFmpeg.
-     */
     this.client.on(
       "station download finish",
       (_station: Station, device: Device) => {
@@ -464,7 +519,6 @@ export class EufyService {
 
         logger.info({ deviceSN }, "Download stream finished, muxing with FFmpeg");
 
-        // Small delay to ensure file streams are fully flushed
         setTimeout(() => {
           this.muxWithFfmpeg(download);
         }, 500);
@@ -472,9 +526,6 @@ export class EufyService {
     );
   }
 
-  /**
-   * Use FFmpeg to combine raw H.264 video and AAC audio into an MP4 container.
-   */
   private muxWithFfmpeg(download: {
     resolve: () => void;
     reject: (err: Error) => void;
@@ -498,16 +549,13 @@ export class EufyService {
 
     const args: string[] = ["-y"];
 
-    // Video input
     args.push("-f", "h264", "-i", download.videoTempPath);
 
-    // Audio input (if available)
     if (audioExists) {
       args.push("-f", "aac", "-i", download.audioTempPath);
       args.push("-map", "0:v", "-map", "1:a");
     }
 
-    // Copy codecs (no re-encoding), optimize for streaming
     args.push("-c:v", "copy");
     if (audioExists) {
       args.push("-c:a", "copy");
