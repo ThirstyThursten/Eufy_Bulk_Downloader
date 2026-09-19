@@ -28,11 +28,16 @@ The fastest way to get up and running is with the one-click launcher scripts. Th
 ./run.sh
 ```
 
-**Windows:**
+**Windows (double-click or from a terminal):**
 
 ```
 run.bat
 ```
+
+> `run.bat` is a thin wrapper that launches `run.ps1` (PowerShell). If you prefer, you can run the PowerShell script directly:
+> ```powershell
+> powershell -ExecutionPolicy Bypass -File run.ps1
+> ```
 
 The launcher will open `http://localhost:5173` in your browser once the servers are ready.
 
