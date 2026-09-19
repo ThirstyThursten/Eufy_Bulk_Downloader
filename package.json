@@ -1,0 +1,15 @@
+{
+  "name": "eufy-bulk-downloader",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Bulk download Eufy Security camera clips via a local web UI",
+  "scripts": {
+    "install:all": "cd backend && npm install && cd ../frontend && npm install",
+    "dev": "concurrently --names backend,frontend --prefix-colors blue,green \"cd backend && npm run dev\" \"cd frontend && npm run dev\"",
+    "build": "cd backend && npm run build && cd ../frontend && npm run build",
+    "start": "concurrently --names backend,frontend --prefix-colors blue,green \"cd backend && npm start\" \"cd frontend && npm run preview\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

@@ -18,6 +18,26 @@ frontend/        React + Vite SPA
     components/    UI components
 ```
 
+## Quick Start
+
+The fastest way to get up and running is with the one-click launcher scripts. They check prerequisites, set up your `.env` file, install dependencies, and start both servers automatically.
+
+**Linux / macOS:**
+
+```bash
+./run.sh
+```
+
+**Windows:**
+
+```
+run.bat
+```
+
+The launcher will open `http://localhost:5173` in your browser once the servers are ready.
+
+If you prefer to set things up manually, follow the steps below.
+
 ## Prerequisites
 
 - **Node.js 20+** (required by eufy-security-client)
