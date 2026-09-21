@@ -254,6 +254,11 @@ export class EufyService {
       logger.info({ count: storeEvents.length }, "Found events in event store (push notifications)");
       return storeEvents;
     }
+    const storeStats = this.eventStore.getStats();
+    logger.info(
+      { storeTotal: storeStats.total, deviceSN: deviceSerialNumber },
+      "No matching events in store for this device/range"
+    );
 
     // --- Try cloud API (quick HTTP calls) ---
     const cloudEvents = await this.getCloudEvents(deviceSerialNumber, from, to);
@@ -336,6 +341,11 @@ export class EufyService {
     }));
   }
 
+  private isHB3Station(station: Station): boolean {
+    const type = station.getDeviceType();
+    return type === 18;
+  }
+
   private async getLocalEvents(
     deviceSerialNumber: string,
     from: Date,
@@ -351,6 +361,20 @@ export class EufyService {
     const stationSN = device.getStationSerial();
     const deviceName = device.getName();
 
+    const station = await this.client!.getStation(stationSN);
+
+    // HomeBase S380 (HB3, DeviceType 18) does not support P2P database
+    // queries — its firmware uses a newer encrypted protocol not yet
+    // implemented in eufy-security-client. Events are collected via
+    // push notifications instead.
+    if (this.isHB3Station(station)) {
+      logger.info(
+        { stationSN, stationType: station.getDeviceType() },
+        "HB3 station detected — P2P database queries not supported, relying on push notification event collection"
+      );
+      return [];
+    }
+
     // Ensure the station is connected via P2P
     try {
       await this.ensureStationP2P(stationSN);
@@ -359,17 +383,10 @@ export class EufyService {
       return [];
     }
 
-    const station = await this.client!.getStation(stationSN);
-
     // Get all camera serial numbers on this station for broader queries
     const allCameraSNs = devices
       .filter((d) => d.isCamera() && d.getStationSerial() === stationSN)
       .map((d) => d.getSerial());
-
-    // Strategy: try databaseQueryByDate with several parameter variations,
-    // then fall back to databaseQueryLocal.
-    // Some HomeBase firmware (e.g. S380/HB3) returns 0 records with default
-    // parameters but works with explicit LOCAL storage type.
 
     // Attempt 1: explicit LOCAL storage type with target device
     let events = await this.tryDatabaseQueryByDate(
@@ -378,37 +395,21 @@ export class EufyService {
     );
     if (events.length > 0) return events.filter((e) => e.deviceSerialNumber === deviceSerialNumber);
 
-    // Attempt 2: default storage type (storage_cloud: -1) with target device
+    // Attempt 2: default storage type with target device
     events = await this.tryDatabaseQueryByDate(
       station, stationSN, [deviceSerialNumber], deviceName, from, to,
       FilterStorageType.NONE
     );
     if (events.length > 0) return events.filter((e) => e.deviceSerialNumber === deviceSerialNumber);
 
-    // Attempt 3: LOCAL storage with ALL cameras on the station
-    if (allCameraSNs.length > 1) {
-      logger.info({ stationSN, cameras: allCameraSNs }, "Trying with all station cameras");
-      events = await this.tryDatabaseQueryByDate(
-        station, stationSN, allCameraSNs, deviceName, from, to,
-        FilterStorageType.LOCAL
-      );
-      if (events.length > 0) return events.filter((e) => e.deviceSerialNumber === deviceSerialNumber);
-    }
-
-    // Attempt 4: raw P2P command with no device filtering and storage_cloud=1
-    events = await this.tryRawDatabaseQuery(
-      station, stationSN, allCameraSNs, deviceName, from, to
-    );
-    if (events.length > 0) return events.filter((e) => e.deviceSerialNumber === deviceSerialNumber);
-
-    // Attempt 5: databaseQueryLocal with LOCAL storage type
+    // Attempt 3: databaseQueryLocal with LOCAL storage type
     events = await this.tryDatabaseQueryLocal(
       station, stationSN, deviceSerialNumber, deviceName, from, to,
       FilterStorageType.LOCAL
     );
     if (events.length > 0) return events;
 
-    // Attempt 6: databaseQueryLocal with default storage type
+    // Attempt 4: databaseQueryLocal with default storage type
     events = await this.tryDatabaseQueryLocal(
       station, stationSN, deviceSerialNumber, deviceName, from, to
     );
@@ -767,14 +768,12 @@ export class EufyService {
       logger.error({ error }, "Eufy connection error");
     });
 
-    // Capture push notification events for the persistent event store.
-    // This is the primary way to collect events from HomeBase S380 (HB3)
-    // whose firmware doesn't support P2P database queries.
     (this.client as any).on("push message", (msg: PushMessage) => {
       if (msg.file_path) {
         this.eventStore.addFromPush(msg);
       }
     });
+    logger.info("Push notification listener active — events will be captured automatically");
 
     this.client.on(
       "station download start",
