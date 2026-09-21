@@ -360,8 +360,17 @@ export class EufyService {
     );
     if (events.length > 0) return events.filter((e) => e.deviceSerialNumber === deviceSerialNumber);
 
-    // Attempt 5: databaseQueryLocal
-    events = await this.tryDatabaseQueryLocal(station, stationSN, deviceSerialNumber, deviceName, from, to);
+    // Attempt 5: databaseQueryLocal with LOCAL storage type
+    events = await this.tryDatabaseQueryLocal(
+      station, stationSN, deviceSerialNumber, deviceName, from, to,
+      FilterStorageType.LOCAL
+    );
+    if (events.length > 0) return events;
+
+    // Attempt 6: databaseQueryLocal with default storage type
+    events = await this.tryDatabaseQueryLocal(
+      station, stationSN, deviceSerialNumber, deviceName, from, to
+    );
     return events;
   }
 
@@ -560,10 +569,11 @@ export class EufyService {
     deviceSN: string,
     deviceName: string,
     from: Date,
-    to: Date
+    to: Date,
+    storageType: FilterStorageType = FilterStorageType.NONE
   ): Promise<EventRecord[]> {
     try {
-      logger.info({ stationSN, deviceSN }, "Trying databaseQueryLocal (P2P)");
+      logger.info({ stationSN, deviceSN, storageType }, "Trying databaseQueryLocal (P2P)");
       const records = await new Promise<DatabaseQueryLocal[]>((resolve, reject) => {
         const timeout = setTimeout(() => {
           this.client!.removeListener("station database query local", handler);
@@ -587,7 +597,7 @@ export class EufyService {
         };
 
         this.client!.on("station database query local", handler);
-        station.databaseQueryLocal([deviceSN], from, to);
+        station.databaseQueryLocal([deviceSN], from, to, 0, 0, storageType);
       });
 
       logger.info({ count: records.length }, "databaseQueryLocal returned records");
