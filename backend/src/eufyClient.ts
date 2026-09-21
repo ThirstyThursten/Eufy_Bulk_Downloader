@@ -16,6 +16,7 @@ import { spawn, ChildProcess } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import pino from "pino";
+import { EventStore, PushMessage } from "./eventStore";
 
 const logger = pino({ name: "eufy-service" });
 
@@ -70,6 +71,7 @@ export class EufyService {
   private _status: ConnectionStatus = "disconnected";
   private _captchaInfo: CaptchaInfo | null = null;
   private _errorMessage: string | null = null;
+  private eventStore!: EventStore;
 
   private activeDownloads = new Map<
     string,
@@ -109,6 +111,8 @@ export class EufyService {
     if (!fs.existsSync(persistentDir)) {
       fs.mkdirSync(persistentDir, { recursive: true });
     }
+
+    this.eventStore = new EventStore(persistentDir);
 
     const config: EufySecurityConfig = {
       username: email,
@@ -224,9 +228,13 @@ export class EufyService {
   /**
    * Fetch video events for a device within a time range.
    *
-   * Strategy: try the cloud API first (fast), then fall back to querying
-   * the HomeBase's local database via P2P, which is where most users'
-   * events actually live.
+   * Strategy:
+   * 1. Check the persistent event store (populated by push notifications)
+   * 2. Try the cloud API (quick HTTP calls)
+   * 3. Fall back to local HomeBase query via P2P
+   *
+   * HomeBase S380 (HB3) firmware does not support P2P database queries,
+   * so the event store (push notifications) is the primary source for those stations.
    */
   async getEvents(
     deviceSerialNumber: string,
@@ -240,7 +248,14 @@ export class EufyService {
       "Fetching events"
     );
 
-    // --- Try cloud API first (quick HTTP calls) ---
+    // --- Check event store first (push notification events) ---
+    const storeEvents = this.getEventsFromStore(deviceSerialNumber, from, to);
+    if (storeEvents.length > 0) {
+      logger.info({ count: storeEvents.length }, "Found events in event store (push notifications)");
+      return storeEvents;
+    }
+
+    // --- Try cloud API (quick HTTP calls) ---
     const cloudEvents = await this.getCloudEvents(deviceSerialNumber, from, to);
     if (cloudEvents.length > 0) {
       logger.info({ count: cloudEvents.length }, "Found events via cloud API");
@@ -254,13 +269,39 @@ export class EufyService {
       if (localEvents.length > 0) {
         logger.info({ count: localEvents.length }, "Found events on HomeBase local storage");
       } else {
-        logger.warn({ deviceSN: deviceSerialNumber }, "No events found via cloud or local query");
+        logger.warn({ deviceSN: deviceSerialNumber }, "No events found via any method");
       }
       return localEvents;
     } catch (err) {
       logger.error({ err }, "Local HomeBase query failed");
       return [];
     }
+  }
+
+  private getEventsFromStore(
+    deviceSerialNumber: string,
+    from: Date,
+    to: Date
+  ): EventRecord[] {
+    const stored = this.eventStore.getEvents(deviceSerialNumber, from, to);
+    return stored.map((e) => ({
+      id: e.id,
+      deviceSerialNumber: e.deviceSN,
+      deviceName: e.deviceName,
+      stationSerialNumber: e.stationSN,
+      storagePath: e.filePath,
+      hevcStoragePath: "",
+      cipherId: e.cipher,
+      startTime: Math.trunc(e.eventTime / 1000),
+      endTime: Math.trunc(e.eventTime / 1000) + 30,
+      thumbPath: "",
+      hasHuman: e.eventType === 3102,
+      videoType: 0,
+    }));
+  }
+
+  getEventStoreStats(): { total: number; byDevice: Record<string, number> } {
+    return this.eventStore.getStats();
   }
 
   private async getCloudEvents(
@@ -682,6 +723,7 @@ export class EufyService {
   async close(): Promise<void> {
     if (this.client) {
       this.savePersistentData();
+      this.eventStore.flush();
       this.client.close();
       this.client = null;
       this._status = "disconnected";
@@ -723,6 +765,15 @@ export class EufyService {
       this._status = "error";
       this._errorMessage = error.message;
       logger.error({ error }, "Eufy connection error");
+    });
+
+    // Capture push notification events for the persistent event store.
+    // This is the primary way to collect events from HomeBase S380 (HB3)
+    // whose firmware doesn't support P2P database queries.
+    (this.client as any).on("push message", (msg: PushMessage) => {
+      if (msg.file_path) {
+        this.eventStore.addFromPush(msg);
+      }
     });
 
     this.client.on(

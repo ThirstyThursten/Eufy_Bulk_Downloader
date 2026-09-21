@@ -96,6 +96,15 @@ export async function getDevices(): Promise<{
   return fetchJson(`${BASE}/devices`);
 }
 
+export interface EventStoreStats {
+  total: number;
+  byDevice: Record<string, number>;
+}
+
+export async function getEventStoreStats(): Promise<EventStoreStats> {
+  return fetchJson(`${BASE}/events/stats`);
+}
+
 export async function getEvents(
   deviceId: string,
   from: string,

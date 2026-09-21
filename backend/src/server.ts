@@ -87,6 +87,17 @@ export function createApp(
     }
   });
 
+  // --- Event Store Stats ---
+
+  /**
+   * GET /api/events/stats
+   * Returns stats about the persistent event store (push notification events).
+   * Useful for showing the user how many events have been collected.
+   */
+  app.get("/api/events/stats", (_req: Request, res: Response) => {
+    res.json(eufyService.getEventStoreStats());
+  });
+
   // --- Events ---
 
   const eventsQuerySchema = z.object({

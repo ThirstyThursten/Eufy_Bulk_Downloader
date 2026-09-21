@@ -19,6 +19,9 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [tfaCode, setTfaCode] = useState("");
   const [captchaCode, setCaptchaCode] = useState("");
+  const [eventStats, setEventStats] = useState<api.EventStoreStats | null>(
+    null
+  );
 
   // Poll connection status
   useEffect(() => {
@@ -43,6 +46,22 @@ export default function App() {
         .then((res) => setDevices(res.devices))
         .catch((err) => setError(err.message));
     }
+  }, [status?.status]);
+
+  // Poll event store stats when connected
+  useEffect(() => {
+    if (status?.status !== "connected") return;
+    const poll = async () => {
+      try {
+        const stats = await api.getEventStoreStats();
+        setEventStats(stats);
+      } catch {
+        // Ignore polling errors
+      }
+    };
+    poll();
+    const interval = setInterval(poll, 10000);
+    return () => clearInterval(interval);
   }, [status?.status]);
 
   const loadEvents = useCallback(async () => {
@@ -199,6 +218,30 @@ export default function App() {
             </div>
           </div>
 
+          {/* Event Collection Status */}
+          <div className="card" style={{ borderLeft: "4px solid #17a2b8" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+              <strong>Event Collection:</strong>
+              <span>
+                {eventStats
+                  ? `${eventStats.total} events captured`
+                  : "Loading..."}
+              </span>
+            </div>
+            {eventStats && eventStats.total > 0 && (
+              <div style={{ fontSize: "0.85em", color: "#666", marginTop: "0.25rem" }}>
+                {Object.entries(eventStats.byDevice)
+                  .map(([name, count]) => `${name}: ${count}`)
+                  .join(" | ")}
+              </div>
+            )}
+            <p style={{ fontSize: "0.85em", color: "#666", marginTop: "0.5rem" }}>
+              Events are captured automatically from push notifications while the
+              app is running. Select a device and date range, then click Load
+              Events to see captured events.
+            </p>
+          </div>
+
           {/* Error display */}
           {error && (
             <div className="card" style={{ borderLeft: "4px solid #dc3545" }}>
@@ -209,11 +252,14 @@ export default function App() {
           {/* Empty state after loading */}
           {!loading && !error && events.length === 0 && (from || to) && (
             <div className="card" style={{ borderLeft: "4px solid #ffc107" }}>
-              <p><strong>No events found</strong> for the selected time range.</p>
+              <p><strong>No events found</strong> for the selected device and time range.</p>
               <p style={{ fontSize: "0.9em", marginTop: "0.5rem", color: "#666" }}>
-                The app queries both the Eufy cloud and your HomeBase local storage.
-                Check the backend terminal for details. Make sure the date range
-                matches events you can see in the Eufy app.
+                Events are collected from push notifications while the app is
+                running. Keep the app open and trigger motion on your cameras to
+                capture new events. HomeBase S380 (HB3) stores events locally but
+                its firmware does not support listing historical events via the
+                current protocol — only new events detected while the app runs are
+                available.
               </p>
             </div>
           )}
