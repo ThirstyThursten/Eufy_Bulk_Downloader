@@ -18,6 +18,7 @@ import {
   DatabaseReturnCode,
   LoginOptions,
   FilterStorageType,
+  StorageType,
 } from "eufy-security-client";
 
 dotenv.config();
@@ -288,54 +289,8 @@ async function main() {
       log("TEST", `  FAILED: ${err instanceof Error ? err.message : err}`);
     }
 
-    // ── Test 6: databaseQueryLocal — full month, LONG timeout (120s) ──
-    log("TEST", "--- 6. databaseQueryLocal (full month, 120s timeout) ---");
-    log("TEST", "  This test takes up to 2 minutes, please wait...");
-    try {
-      const p = waitForEvent(client, "station database query local", sn, LONG_TIMEOUT);
-      station.databaseQueryLocal(stationDevices, monthStart, monthEnd);
-      const result = await p;
-      log("TEST", `  code=${result.returnCode}, records=${Array.isArray(result.data) ? result.data.length : "?"}`);
-      if (Array.isArray(result.data) && result.data.length > 0) {
-        log("TEST", "  First record:", JSON.stringify(result.data[0]).slice(0, 500));
-      }
-    } catch (err) {
-      log("TEST", `  FAILED: ${err instanceof Error ? err.message : err}`);
-    }
-
-    // ── Test 7: databaseQueryLocal — 24h range, LONG timeout ────
-    log("TEST", "--- 7. databaseQueryLocal (24h, 120s timeout) ---");
-    log("TEST", "  This test takes up to 2 minutes, please wait...");
-    try {
-      const p = waitForEvent(client, "station database query local", sn, LONG_TIMEOUT);
-      station.databaseQueryLocal(stationDevices, dayStart, dayEnd);
-      const result = await p;
-      log("TEST", `  code=${result.returnCode}, records=${Array.isArray(result.data) ? result.data.length : "?"}`);
-      if (Array.isArray(result.data) && result.data.length > 0) {
-        log("TEST", "  First record:", JSON.stringify(result.data[0]).slice(0, 500));
-      }
-    } catch (err) {
-      log("TEST", `  FAILED: ${err instanceof Error ? err.message : err}`);
-    }
-
-    // ── Test 8: databaseQueryLocal — LOCAL storage type, 24h, LONG timeout ──
-    log("TEST", "--- 8. databaseQueryLocal (LOCAL, 24h, 120s timeout) ---");
-    log("TEST", "  This test takes up to 2 minutes, please wait...");
-    try {
-      const p = waitForEvent(client, "station database query local", sn, LONG_TIMEOUT);
-      station.databaseQueryLocal(stationDevices, dayStart, dayEnd, 0, 0, FilterStorageType.LOCAL);
-      const result = await p;
-      log("TEST", `  code=${result.returnCode}, records=${Array.isArray(result.data) ? result.data.length : "?"}`);
-      if (Array.isArray(result.data) && result.data.length > 0) {
-        log("TEST", "  First record:", JSON.stringify(result.data[0]).slice(0, 500));
-      }
-    } catch (err) {
-      log("TEST", `  FAILED: ${err instanceof Error ? err.message : err}`);
-    }
-
-    // ── Test 9: raw P2P CMD_DATABASE_QUERY_LOCAL (10017) with custom params ──
-    log("TEST", "--- 9. raw P2P CMD_DATABASE_QUERY_LOCAL (count=50, 120s timeout) ---");
-    log("TEST", "  This test takes up to 2 minutes, please wait...");
+    // ── Test 6: raw P2P CMD_DATABASE_QUERY (10000) — might be a simpler query ──
+    log("TEST", "--- 6. raw P2P CMD_DATABASE_QUERY (10000, 30s) ---");
     try {
       const p2pSession = (station as any).p2pSession;
       const rawStation = (station as any).rawStation;
@@ -343,7 +298,32 @@ async function main() {
       const startStr = fmtDate(dayStart);
       const endStr = fmtDate(dayEnd);
 
-      const p = waitForEvent(client, "station database query local", sn, LONG_TIMEOUT);
+      // Listen for ANY database event (the response cmd might differ)
+      const p = new Promise<any>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          (client as any).removeListener("station database query by date", h1);
+          (client as any).removeListener("station database query local", h2);
+          reject(new Error("CMD 10000 timed out after 30s"));
+        }, QUERY_TIMEOUT);
+
+        const h1 = (s: Station, rc: number, data: any) => {
+          if (s.getSerial() !== sn) return;
+          clearTimeout(timer);
+          (client as any).removeListener("station database query by date", h1);
+          (client as any).removeListener("station database query local", h2);
+          resolve({ event: "query by date", returnCode: rc, count: Array.isArray(data) ? data.length : "?", data });
+        };
+        const h2 = (s: Station, rc: number, data: any) => {
+          if (s.getSerial() !== sn) return;
+          clearTimeout(timer);
+          (client as any).removeListener("station database query by date", h1);
+          (client as any).removeListener("station database query local", h2);
+          resolve({ event: "query local", returnCode: rc, count: Array.isArray(data) ? data.length : "?", data });
+        };
+        (client as any).on("station database query by date", h1);
+        (client as any).on("station database query local", h2);
+      });
+
       p2pSession.sendCommandWithStringPayload({
         commandType: 1350,
         value: JSON.stringify({
@@ -352,9 +332,9 @@ async function main() {
           mChannel: 0,
           mValue3: 0,
           payload: {
-            cmd: 10017,
+            cmd: 10000,
             payload: {
-              count: 50,
+              count: 100,
               detection_type: 0,
               device_info: stationDevices.map((s: string) => ({ device_sn: s })),
               end_date: endStr,
@@ -373,10 +353,7 @@ async function main() {
         channel: 0,
       });
       const result = await p;
-      log("TEST", `  code=${result.returnCode}, records=${Array.isArray(result.data) ? result.data.length : "?"}`);
-      if (Array.isArray(result.data) && result.data.length > 0) {
-        log("TEST", "  First record:", JSON.stringify(result.data[0]).slice(0, 500));
-      }
+      log("TEST", "  Result:", JSON.stringify(result).slice(0, 1000));
     } catch (err) {
       log("TEST", `  FAILED: ${err instanceof Error ? err.message : err}`);
     }
@@ -384,30 +361,104 @@ async function main() {
     cleanupLogger();
   }
 
-  // ── Cloud API probe ──────────────────────────────────────────────
-  log("CLOUD", "\n━━━ Cloud API ━━━");
+  // ── Cloud API probe (expanded) ──────────────────────────────────
+  log("CLOUD", "\n━━━ Cloud API (expanded) ━━━");
   const now = new Date();
   const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+  const api = client.getApi();
 
   for (const d of devices) {
     if (!d.isCamera()) continue;
     const dSN = d.getSerial();
+    const stationSN = d.getStationSerial();
     log("CLOUD", `Camera: ${d.getName()} (${dSN})`);
 
+    // Standard calls
     try {
-      const videoEvents = await client.getApi().getVideoEvents(yesterday, now, { deviceSN: dSN });
-      log("CLOUD", `  getVideoEvents: ${videoEvents.length} events`);
+      const events = await api.getVideoEvents(yesterday, now, { deviceSN: dSN });
+      log("CLOUD", `  getVideoEvents(device filter): ${events.length} events`);
     } catch (err) {
       log("CLOUD", `  getVideoEvents FAILED: ${err instanceof Error ? err.message : err}`);
     }
 
     try {
-      const historyEvents = await client.getApi().getHistoryEvents(yesterday, now, { deviceSN: dSN });
-      log("CLOUD", `  getHistoryEvents: ${historyEvents.length} events`);
+      const events = await api.getHistoryEvents(yesterday, now, { deviceSN: dSN });
+      log("CLOUD", `  getHistoryEvents(device filter): ${events.length} events`);
     } catch (err) {
       log("CLOUD", `  getHistoryEvents FAILED: ${err instanceof Error ? err.message : err}`);
     }
+
+    // NEW: getAlarmEvents
+    try {
+      const events = await api.getAlarmEvents(yesterday, now, { deviceSN: dSN });
+      log("CLOUD", `  getAlarmEvents(device filter): ${events.length} events`);
+      if (events.length > 0) log("CLOUD", "  First alarm:", JSON.stringify(events[0]).slice(0, 500));
+    } catch (err) {
+      log("CLOUD", `  getAlarmEvents FAILED: ${err instanceof Error ? err.message : err}`);
+    }
+
+    // NEW: filter by storageType LOCAL
+    try {
+      const events = await api.getVideoEvents(yesterday, now, { deviceSN: dSN, storageType: StorageType.LOCAL });
+      log("CLOUD", `  getVideoEvents(LOCAL storage): ${events.length} events`);
+      if (events.length > 0) log("CLOUD", "  First event:", JSON.stringify(events[0]).slice(0, 500));
+    } catch (err) {
+      log("CLOUD", `  getVideoEvents(LOCAL) FAILED: ${err instanceof Error ? err.message : err}`);
+    }
+
+    // NEW: filter by station instead of device
+    try {
+      const events = await api.getVideoEvents(yesterday, now, { stationSN });
+      log("CLOUD", `  getVideoEvents(station filter): ${events.length} events`);
+      if (events.length > 0) log("CLOUD", "  First event:", JSON.stringify(events[0]).slice(0, 500));
+    } catch (err) {
+      log("CLOUD", `  getVideoEvents(station) FAILED: ${err instanceof Error ? err.message : err}`);
+    }
+
+    // NEW: no filter at all
+    try {
+      const events = await api.getVideoEvents(yesterday, now);
+      log("CLOUD", `  getVideoEvents(no filter): ${events.length} events`);
+      if (events.length > 0) log("CLOUD", "  First event:", JSON.stringify(events[0]).slice(0, 500));
+    } catch (err) {
+      log("CLOUD", `  getVideoEvents(no filter) FAILED: ${err instanceof Error ? err.message : err}`);
+    }
+
+    // NEW: getAllVideoEvents (15-year range, no date filter)
+    try {
+      const events = await api.getAllVideoEvents({ deviceSN: dSN });
+      log("CLOUD", `  getAllVideoEvents: ${events.length} events`);
+      if (events.length > 0) log("CLOUD", "  First event:", JSON.stringify(events[0]).slice(0, 500));
+    } catch (err) {
+      log("CLOUD", `  getAllVideoEvents FAILED: ${err instanceof Error ? err.message : err}`);
+    }
+
+    // NEW: getAllHistoryEvents
+    try {
+      const events = await api.getAllHistoryEvents({ deviceSN: dSN });
+      log("CLOUD", `  getAllHistoryEvents: ${events.length} events`);
+      if (events.length > 0) log("CLOUD", "  First event:", JSON.stringify(events[0]).slice(0, 500));
+    } catch (err) {
+      log("CLOUD", `  getAllHistoryEvents FAILED: ${err instanceof Error ? err.message : err}`);
+    }
+
+    break; // Only test the first camera for cloud API
   }
+
+  // ── Push notification probe (30s listener) ───────────────────────
+  log("PUSH", "\n━━━ Push Notification Listener (30s) ━━━");
+  log("PUSH", "Listening for push messages for 30 seconds...");
+  log("PUSH", "Trigger a motion event on your camera NOW if possible.");
+  let pushCount = 0;
+  const pushHandler = (...args: unknown[]) => {
+    pushCount++;
+    log("PUSH", `  Push message #${pushCount}:`, JSON.stringify(args).slice(0, 1000));
+  };
+  (client as any).on("push message", pushHandler);
+  await new Promise((r) => setTimeout(r, 30_000));
+  (client as any).removeListener("push message", pushHandler);
+  log("PUSH", `Received ${pushCount} push messages in 30 seconds`);
 
   log("DONE", "Diagnostic complete. Closing connection...");
   client.close();
